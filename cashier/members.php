@@ -1,0 +1,1409 @@
+<?php
+include "../config/db.php";
+
+if (!isset($_SESSION['user']) || $_SESSION['user']['role'] !== 'cashier') {
+    header("Location: ../index.php");
+    exit();
+}
+
+$user = $_SESSION['user'];
+
+// Fetch gym settings
+$settings = $conn->query("SELECT * FROM gym_settings WHERE id = 1")->fetch_assoc();
+if (!$settings) {
+    // Insert default settings if not exists
+    $conn->query("INSERT INTO gym_settings (gym_name, logo_path, background_path) VALUES ('Gym Management System', 'gym logo.jpg', 'gym background.jpg')");
+    $settings = $conn->query("SELECT * FROM gym_settings WHERE id = 1")->fetch_assoc();
+}
+
+// Function to generate unique member code
+function generateMemberCode() {
+    return 'MEM' . date('Y') . strtoupper(substr(md5(uniqid(mt_rand(), true)), 0, 6));
+}
+
+// Function to generate unique receipt number
+function generateReceiptNo() {
+    return 'R' . date('Ymd') . strtoupper(substr(md5(uniqid(mt_rand(), true)), 0, 6));
+}
+
+// Function to generate QR code
+function generateQRCode($qr_token) {
+    require_once __DIR__ . '/../phpqrcode/qrlib.php';
+
+
+    $qr_data = $qr_token;
+    $filename = $qr_token . '.png';
+    $filepath = __DIR__ . '/../qr_codes/' . $filename;
+
+    QRcode::png($qr_data, $filepath, QR_ECLEVEL_L, 10, 4);
+
+    return 'qr_codes/' . $filename;
+}
+
+// Function to generate unique QR token
+function generateQRToken() {
+    do {
+        $token = bin2hex(random_bytes(32)); // 64 character hex string
+        $stmt = $GLOBALS['conn']->prepare("SELECT id FROM members WHERE qr_token = ?");
+        $stmt->bind_param("s", $token);
+        $stmt->execute();
+        $stmt->store_result();
+        $exists = $stmt->num_rows > 0;
+        $stmt->close();
+    } while ($exists || $token === '0' || empty($token));
+
+    return $token;
+}
+
+// Function to calculate end date based on plan and start date
+function calculateEndDate($plan, $start_date) {
+    $start = strtotime($start_date);
+    $end = $start;
+
+    switch ($plan) {
+        case 'Half Month':
+            $end = strtotime('+15 days', $start);
+            break;
+        case '1 Month':
+            $end = strtotime('+1 month', $start);
+            break;
+        case '2 Months':
+            $end = strtotime('+2 months', $start);
+            break;
+        case '3 Months':
+            $end = strtotime('+3 months', $start);
+            break;
+        case '4 Months':
+            $end = strtotime('+4 months', $start);
+            break;
+        case '5 Months':
+            $end = strtotime('+5 months', $start);
+            break;
+        case '6 Months':
+            $end = strtotime('+6 months', $start);
+            break;
+        case '7 Months':
+            $end = strtotime('+7 months', $start);
+            break;
+        case '8 Months':
+            $end = strtotime('+8 months', $start);
+            break;
+        case '9 Months':
+            $end = strtotime('+9 months', $start);
+            break;
+        case '10 Months':
+            $end = strtotime('+10 months', $start);
+            break;
+        case '11 Months':
+            $end = strtotime('+11 months', $start);
+            break;
+        case '1 Year':
+            $end = strtotime('+1 year', $start);
+            break;
+        case '2 Years':
+            $end = strtotime('+2 years', $start);
+            break;
+        case '3 Years':
+            $end = strtotime('+3 years', $start);
+            break;
+        case 'Per Session':
+        case 'Manual':
+        default:
+            $end = $start;
+            break;
+    }
+
+    return date('Y-m-d', $end);
+}
+
+// Handle member addition
+if (isset($_POST['add_member'])) {
+    // Check if QR code was generated
+    if (!isset($_POST['qr_generated']) || $_POST['qr_generated'] !== '1') {
+        header("Location: members.php?error=qr_not_generated");
+        exit();
+    }
+
+    // Use generated values (QR is required on cashier side)
+    $member_code = isset($_POST['generated_member_code']) && !empty($_POST['generated_member_code']) ? $_POST['generated_member_code'] : generateMemberCode();
+    $qr_code_path = isset($_POST['generated_qr_path']) ? $_POST['generated_qr_path'] : '';
+
+    $fullname = $_POST['fullname'];
+    $email = $_POST['email'];
+    $phone = $_POST['phone'];
+    $address = $_POST['address'];
+    $plan = $_POST['plan'];
+    $start_date = $_POST['start_date'];
+    $end_date = $_POST['end_date'];
+    $is_student = isset($_POST['is_student']) ? 1 : 0;
+    $student_id = $is_student ? $_POST['student_id'] : null;
+
+    // Check if member with same fullname already exists
+    $check_stmt = $conn->prepare("SELECT id FROM members WHERE fullname = ?");
+    $check_stmt->bind_param("s", $fullname);
+    $check_stmt->execute();
+    $check_stmt->store_result();
+    if ($check_stmt->num_rows > 0) {
+        $check_stmt->close();
+        header("Location: members.php?duplicate_error=1");
+        exit();
+    }
+    $check_stmt->close();
+
+    // Always use the QR token generated by generate_member_qr.php
+    // This ensures the token encoded in the QR image matches what we store in the database
+    $qr_token = isset($_POST['qr_token']) ? $_POST['qr_token'] : '';
+
+    // Debug logging
+    error_log("DEBUG: qr_token from POST: '" . $qr_token . "'");
+    error_log("DEBUG: qr_code_path from POST: '" . $qr_code_path . "'");
+
+    // Fallback safety: if for some reason no token/path came from the frontend, generate a fresh one
+    if (empty($qr_token)) {
+        error_log("DEBUG: No qr_token from POST, generating fallback token");
+        $qr_token = generateQRToken();
+        $qr_code_path = generateQRCode($qr_token);
+    } elseif (empty($qr_code_path)) {
+        // If we have a token but no path, generate the QR image on the server
+        error_log("DEBUG: Have qr_token but no qr_code_path, generating QR code");
+        $qr_code_path = generateQRCode($qr_token);
+    } else {
+        error_log("DEBUG: Using qr_token and qr_code_path from POST");
+    }
+
+    error_log("DEBUG: Final qr_token: '" . $qr_token . "', qr_code_path: '" . $qr_code_path . "'");
+
+    // Handle NULL values properly for prepared statement
+    $student_id_value = $student_id ?: null;
+
+    $stmt = $conn->prepare("INSERT INTO members (member_code, fullname, email, phone, address, plan, start_date, end_date, is_student, student_id, qr_code, qr_token, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+
+    // Use individual bind_param calls to handle NULL values properly
+    $stmt->bind_param("ssssssssisssi", $member_code, $fullname, $email, $phone, $address, $plan, $start_date, $end_date, $is_student, $student_id_value, $qr_code_path, $qr_token, $user['id']);
+
+    error_log("DEBUG: About to execute INSERT with qr_token: '$qr_token', student_id: '" . ($student_id_value ?? 'NULL') . "'");
+    if ($stmt->execute()) {
+        $member_id = $stmt->insert_id;
+        error_log("DEBUG: INSERT successful, member_id: $member_id");
+        $stmt->close();
+    } else {
+        // Log the error for debugging
+        error_log("Failed to insert member: " . $stmt->error);
+        header("Location: members.php?error=1");
+        exit();
+    }
+
+    // Handle payment if provided
+    if (isset($_POST['payment_method']) && !empty($_POST['amount'])) {
+        $amount = $_POST['amount'];
+        $payment_method = $_POST['payment_method'];
+        $discount_amount = $is_student ? ($amount * 0.20) : 0.00; // 20% discount for students
+        $is_student_discount = $is_student ? 1 : 0;
+        $receipt_no = generateReceiptNo();
+        $reference_no = isset($_POST['reference_no']) ? $_POST['reference_no'] : null;
+
+        $stmt = $conn->prepare("INSERT INTO payments (member_id, amount, receipt_no, payment_date, payment_method, is_student_discount, student_id, discount_amount, reference_no) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
+        $stmt->bind_param("idsssssds", $member_id, $amount, $receipt_no, date('Y-m-d'), $payment_method, $is_student_discount, $student_id, $discount_amount, $reference_no);
+        $stmt->execute();
+        $stmt->close();
+    }
+
+    header("Location: members.php?add_success=1");
+    exit();
+}
+
+// Handle quick add per session member
+if (isset($_POST['quick_add_member'])) {
+    $member_code = generateMemberCode();
+    $fullname = $_POST['fullname'];
+    $phone = $_POST['phone'];
+    $today = date('Y-m-d');
+    $is_student = isset($_POST['is_student']) ? 1 : 0;
+    $student_id = $is_student ? $_POST['student_id'] : '';
+
+    // Check if member with same fullname already exists
+    $check_stmt = $conn->prepare("SELECT id FROM members WHERE fullname = ?");
+    $check_stmt->bind_param("s", $fullname);
+    $check_stmt->execute();
+    $check_stmt->store_result();
+    if ($check_stmt->num_rows > 0) {
+        $check_stmt->close();
+        header("Location: members.php?duplicate_error=1");
+        exit();
+    }
+    $check_stmt->close();
+
+    // Generate QR token and code for quick add member
+    $qr_token = generateQRToken();
+    $qr_code_path = generateQRCode($qr_token);
+
+    $stmt = $conn->prepare("INSERT INTO members (member_code, fullname, phone, plan, start_date, end_date, is_student, student_id, qr_code, qr_token, created_by) VALUES (?, ?, ?, 'Per Session', ?, ?, ?, ?, ?, ?, ?)");
+    // Types: member_code (s), fullname (s), phone (s), start_date (s), end_date (s), is_student (i), student_id (s), qr_code (s), qr_token (s), created_by (i)
+    $stmt->bind_param("sssssisssi", $member_code, $fullname, $phone, $today, $today, $is_student, $student_id, $qr_code_path, $qr_token, $user['id']);
+    if ($stmt->execute()) {
+        $member_id = $stmt->insert_id;
+        $stmt->close();
+
+        // Add payment record with student discount if applicable
+        $amount = $_POST['amount']; // Use the posted amount
+        $discount_amount = $is_student ? ($amount * 0.20) : 0.00; // 20% discount for students
+        $is_student_discount = $is_student ? 1 : 0;
+        $receipt_no = generateReceiptNo();
+
+        $stmt = $conn->prepare("INSERT INTO payments (member_id, amount, receipt_no, payment_date, is_student_discount, student_id, discount_amount) VALUES (?, ?, ?, ?, ?, ?, ?)");
+        $stmt->bind_param("idssisd", $member_id, $amount, $receipt_no, $today, $is_student_discount, $student_id, $discount_amount);
+        if ($stmt->execute()) {
+            $stmt->close();
+
+            header("Location: members.php?quick_add_success=1");
+        } else {
+            header("Location: members.php?quick_add_error=1");
+        }
+    } else {
+        header("Location: members.php?quick_add_error=1");
+    }
+}
+
+// Handle member update
+if (isset($_POST['update_member'])) {
+    $id = $_POST['id'];
+    $member_code = $_POST['member_code'];
+    $fullname = $_POST['fullname'];
+    $email = $_POST['email'];
+    $phone = $_POST['phone'];
+    $address = $_POST['address'];
+    $plan = $_POST['plan'];
+    $start_date = $_POST['start_date'];
+    $end_date = $_POST['end_date'];
+    $status = $_POST['status'];
+    $is_student = isset($_POST['is_student']) ? 1 : 0;
+    $student_id = $is_student ? $_POST['student_id'] : null;
+
+    $stmt = $conn->prepare("UPDATE members SET member_code=?, fullname=?, email=?, phone=?, address=?, plan=?, start_date=?, end_date=?, status=?, is_student=?, student_id=? WHERE id=?");
+    $stmt->bind_param("sssssssssisi", $member_code, $fullname, $email, $phone, $address, $plan, $start_date, $end_date, $status, $is_student, $student_id, $id);
+    if ($stmt->execute()) {
+        header("Location: members.php?success=1");
+        exit();
+    } else {
+        header("Location: members.php?error=1");
+        exit();
+    }
+    $stmt->close();
+}
+
+// Handle member deletion
+if (isset($_GET['delete'])) {
+    $id = $_GET['delete'];
+    $conn->query("DELETE FROM members WHERE id=$id");
+    header("Location: members.php?delete_success=1");
+    exit();
+}
+
+// Handle filters
+$plan_filter = isset($_GET['plan_filter']) ? $_GET['plan_filter'] : 'all';
+$payment_filter = isset($_GET['payment_filter']) ? $_GET['payment_filter'] : 'all';
+$search_term = isset($_GET['search']) ? $_GET['search'] : '';
+
+// Fetch members with payment status and creator info
+$query = "SELECT m.*,
+          CASE WHEN EXISTS (SELECT 1 FROM payments p WHERE p.member_id = m.id) THEN 1 ELSE 0 END as has_payment,
+          (SELECT id FROM payments p WHERE p.member_id = m.id ORDER BY p.payment_date DESC LIMIT 1) as latest_payment_id,
+          u.role as created_by_role
+          FROM members m
+          LEFT JOIN users u ON m.created_by = u.id";
+
+$where_conditions = [];
+
+if ($plan_filter !== 'all') {
+    $where_conditions[] = "m.plan = '" . $conn->real_escape_string($plan_filter) . "'";
+}
+
+if ($payment_filter == 'paid') {
+    $where_conditions[] = "EXISTS (SELECT 1 FROM payments p WHERE p.member_id = m.id)";
+} elseif ($payment_filter == 'not_paid') {
+    $where_conditions[] = "NOT EXISTS (SELECT 1 FROM payments p WHERE p.member_id = m.id)";
+}
+
+if (!empty($search_term)) {
+    $where_conditions[] = "(m.fullname LIKE '%" . $conn->real_escape_string($search_term) . "%' OR m.email LIKE '%" . $conn->real_escape_string($search_term) . "%' OR m.phone LIKE '%" . $conn->real_escape_string($search_term) . "%')";
+}
+
+if (!empty($where_conditions)) {
+    $query .= " WHERE " . implode(" AND ", $where_conditions);
+}
+
+$query .= " ORDER BY m.created_at DESC";
+
+$members = $conn->query($query);
+
+// Handle edit member
+$edit_member = null;
+if (isset($_GET['edit'])) {
+    $edit_id = $_GET['edit'];
+    $edit_member = $conn->query("SELECT * FROM members WHERE id = $edit_id")->fetch_assoc();
+}
+?>
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Member Management - Gym Management System</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <link href="../assets/style.css" rel="stylesheet">
+</head>
+<body>
+    <div class="d-flex">
+        <!-- Sidebar -->
+        <nav id="sidebar" class="bg-<?php echo htmlspecialchars($settings['sidebar_theme']); ?> <?php echo ($settings['sidebar_theme'] == 'light') ? 'text-dark' : 'text-white'; ?> vh-100" style="width: 250px;">
+            <div class="p-3">
+                <div class="text-center mb-4">
+                    <img src="../<?php echo htmlspecialchars($settings['logo_path']); ?>" alt="Gym Logo" class="rounded-circle mb-2" style="width: 80px; height: 80px;">
+                    <h5 class="fw-bold"><?php echo htmlspecialchars($settings['gym_name']); ?></h5>
+                </div>
+                <ul class="nav flex-column">
+                    <li class="nav-item mb-2">
+                        <a class="nav-link text-white" href="dashboard.php">
+                            <i class="fas fa-tachometer-alt me-2"></i>Dashboard
+                        </a>
+                    </li>
+                    <li class="nav-item mb-2">
+                        <a class="nav-link text-white active" href="members.php">
+                            <i class="fas fa-users me-2"></i>Members
+                        </a>
+                    </li>
+
+                    <li class="nav-item mb-2">
+                        <a class="nav-link text-white" href="attendance.php">
+                            <i class="fas fa-calendar-check me-2"></i>Attendance
+                        </a>
+                    </li>
+                    <li class="nav-item mt-4">
+                        <a class="nav-link text-white" href="../logout.php">
+                            <i class="fas fa-sign-out-alt me-2"></i>Logout
+                        </a>
+                    </li>
+                </ul>
+            </div>
+        </nav>
+
+        <!-- Main Content -->
+        <div class="flex-grow-1">
+            <!-- Top Bar -->
+            <nav class="navbar navbar-light bg-light border-bottom">
+                <div class="container-fluid">
+                    <button class="btn btn-outline-secondary me-3" id="sidebarToggle">
+                        <i class="fas fa-bars"></i>
+                    </button>
+                    <span class="navbar-brand mb-0 h1">Member Management - <?php echo htmlspecialchars($user['fullname']); ?> (Cashier)</span>
+                </div>
+            </nav>
+
+            <!-- Notification Messages -->
+            <?php if (isset($_GET['add_success'])): ?>
+            <div class="alert alert-success alert-dismissible fade show mt-3" role="alert">
+                Member added successfully!
+                <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+            </div>
+            <?php elseif (isset($_GET['quick_add_success'])): ?>
+            <div class="alert alert-success alert-dismissible fade show mt-3" role="alert">
+                Member added successfully via Quick Add!
+                <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+            </div>
+            <?php elseif (isset($_GET['success'])): ?>
+            <div class="alert alert-success alert-dismissible fade show mt-3" role="alert">
+                Member updated successfully!
+                <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+            </div>
+            <?php elseif (isset($_GET['delete_success'])): ?>
+            <div class="alert alert-success alert-dismissible fade show mt-3" role="alert">
+                Member deleted successfully!
+                <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+            </div>
+            <?php elseif (isset($_GET['quick_add_error'])): ?>
+            <div class="alert alert-danger alert-dismissible fade show mt-3" role="alert">
+                Failed to add member via Quick Add. Please try again.
+                <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+            </div>
+            <?php elseif (isset($_GET['duplicate_error'])): ?>
+            <div class="alert alert-danger alert-dismissible fade show mt-3" role="alert">
+                A member with this full name already exists. Please use a different name.
+                <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+            </div>
+            <?php elseif (isset($_GET['error'])): ?>
+            <div class="alert alert-danger alert-dismissible fade show mt-3" role="alert">
+                Failed to update member. Please try again.
+                <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+            </div>
+            <?php endif; ?>
+
+            <div class="container-fluid mt-4">
+        <div class="row">
+            <div class="col-12">
+                <div class="d-flex justify-content-between align-items-center mb-4">
+                    <h1 class="h3">Member Management</h1>
+                    <div>
+                        <button class="btn btn-success me-2" data-bs-toggle="modal" data-bs-target="#quickAddModal">
+                            <i class="fas fa-plus me-1"></i>Quick Add Per Session
+                        </button>
+                        <button class="btn btn-primary me-2" data-bs-toggle="modal" data-bs-target="#addMemberModal">
+                            <i class="fas fa-plus me-1"></i>Add Member
+                        </button>
+                        <a href="payments.php" class="btn btn-info">
+                            <i class="fas fa-credit-card me-1"></i>Payment Management
+                        </a>
+                    </div>
+                </div>
+
+                <!-- Filter Section -->
+                <div class="row mb-3">
+                    <div class="col-md-3">
+                        <label for="searchInput" class="form-label">Search Members</label>
+                        <input type="text" class="form-control" id="searchInput" placeholder="Search by name, email, or phone..." value="<?php echo htmlspecialchars($search_term); ?>">
+                    </div>
+                    <div class="col-md-3">
+                        <label for="planFilterSelect" class="form-label">Filter by Plan</label>
+                        <select class="form-select" id="planFilterSelect" onchange="applyFilters()">
+                            <option value="all" <?php echo $plan_filter == 'all' ? 'selected' : ''; ?>>All Plans</option>
+                            <option value="Per Session" <?php echo $plan_filter == 'Per Session' ? 'selected' : ''; ?>>Per Session</option>
+                            <option value="Half Month" <?php echo $plan_filter == 'Half Month' ? 'selected' : ''; ?>>Half Month</option>
+                            <option value="Monthly" <?php echo $plan_filter == 'Monthly' ? 'selected' : ''; ?>>Monthly</option>
+                            <option value="Annual" <?php echo $plan_filter == 'Annual' ? 'selected' : ''; ?>>Annual</option>
+                        </select>
+                    </div>
+                    <div class="col-md-3">
+                        <label for="paymentFilterSelect" class="form-label">Filter by Payment Status</label>
+                        <select class="form-select" id="paymentFilterSelect" onchange="applyFilters()">
+                            <option value="all" <?php echo $payment_filter == 'all' ? 'selected' : ''; ?>>All Members</option>
+                            <option value="paid" <?php echo $payment_filter == 'paid' ? 'selected' : ''; ?>>Paid</option>
+                            <option value="not_paid" <?php echo $payment_filter == 'not_paid' ? 'selected' : ''; ?>>Not Paid</option>
+                        </select>
+                    </div>
+                    <div class="col-md-3 d-flex align-items-end">
+                        <button class="btn btn-primary me-2" onclick="applyFilters()">Search</button>
+                        <button class="btn btn-secondary" onclick="clearFilters()">Clear</button>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-body">
+                        <div class="table-responsive">
+                            <table class="table table-striped">
+                                <thead>
+                                    <tr>
+                                        <th>Full Name</th>
+                                        <th>Plan</th>
+                                        <th>Paid</th>
+                                        <th>Student</th>
+                                        <th>Expiry</th>
+                                        <th>Added By</th>
+                                        <th>Actions</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <?php while ($member = $members->fetch_assoc()): ?>
+                                    <tr>
+                                        <td><?php echo htmlspecialchars($member['fullname']); ?></td>
+                                        <td><?php echo htmlspecialchars($member['plan']); ?></td>
+                                        <td><?php echo $member['has_payment'] ? '<span class="badge bg-success">Paid</span>' : '<span class="badge bg-warning">Not Paid</span>'; ?></td>
+                                        <td><?php echo $member['is_student'] ? '<span class="badge bg-info">Student</span>' : '<span class="badge bg-secondary">Regular</span>'; ?></td>
+                                                <td>
+                                                    <?php
+                                                    $start_date = strtotime($member['start_date']);
+                                                    $end_date = strtotime($member['end_date']);
+                                                    $today = strtotime(date('Y-m-d'));
+                                                    $current_hour = (int)date('H');
+                                                    $closing_hour = 21; // 9pm
+                                                    $is_expired = ($today > $end_date) || ($member['plan'] != 'Per Session' && $today == $end_date && $current_hour >= $closing_hour);
+
+                                                    // Normalize dates to Y-m-d strings for clear comparisons
+                                                    $start_str = date('Y-m-d', $start_date);
+                                                    $end_str = date('Y-m-d', $end_date);
+                                                    $today_str = date('Y-m-d', $today);
+
+                                                    if (strtolower($member['plan']) == 'per session') {
+                                                        // Per Session rules (same as admin):
+                                                        // - If start/end are in the future  -> "Starts in X days"
+                                                        // - If start/end are in the past    -> "Expired"
+                                                        // - If start/end are today          -> "Until today"
+                                                        if ($today_str < $start_str) {
+                                                            $days_to_start = ceil(($start_date - $today) / (60 * 60 * 24));
+                                                            echo '<span class="badge bg-info">Starts in ' . $days_to_start . ' days</span>';
+                                                        } elseif ($today_str > $end_str) {
+                                                            echo '<span class="badge bg-danger">Expired</span>';
+                                                        } else {
+                                                            // Today is within [start, end], and for per session this means "today"
+                                                            echo '<span class="badge bg-info">Until today</span>';
+                                                        }
+                                                    } else {
+                                                        if ($today < $start_date) {
+                                                            $days_to_start = ceil(($start_date - $today) / (60 * 60 * 24));
+                                                            echo '<span class="badge bg-info">Starts in ' . $days_to_start . ' days</span>';
+                                                        } elseif ($is_expired) {
+                                                            echo '<span class="badge bg-danger">Expired</span>';
+                                                        } elseif ($end_date == $today) {
+                                                            echo 'Until today';
+                                                        } else {
+                                                            $days_diff = ($end_date - $today) / (60 * 60 * 24);
+                                                            if ($days_diff <= 7) {
+                                                                echo '<span class="badge bg-warning">' . ceil($days_diff) . ' days left</span>';
+                                                            } else {
+                                                                echo '<span class="badge bg-success">' . ceil($days_diff) . ' days left</span>';
+                                                            }
+                                                        }
+                                                    }
+                                                    ?>
+                                                </td>
+                                                </td>
+                                                <td>
+                                                    <?php
+                                                    $role = $member['created_by_role'] ?? 'Unknown';
+                                                    if ($role == 'admin') {
+                                                        echo '<span class="badge bg-danger">Admin</span>';
+                                                    } elseif ($role == 'cashier') {
+                                                        echo '<span class="badge bg-success">Cashier</span>';
+                                                    } else {
+                                                        echo '<span class="badge bg-secondary">Unknown</span>';
+                                                    }
+                                                    ?>
+                                                </td>
+                                                <td>
+                                                    <button type="button" class="btn btn-sm btn-outline-secondary me-1" onclick="viewQR('<?php echo htmlspecialchars($member['fullname']); ?>', '<?php echo htmlspecialchars($member['qr_code']); ?>')">
+                                                        <i class="fas fa-qrcode"></i> View QR
+                                                    </button>
+                                                    <?php if (!$member['has_payment'] || $is_expired): ?>
+                                                    <a href="payments.php?member_id=<?php echo $member['id']; ?>" class="btn btn-sm btn-outline-success me-1">
+                                                        <i class="fas fa-credit-card"></i> Pay
+                                                    </a>
+                                                    <?php endif; ?>
+                                            <?php if ($member['has_payment']): ?>
+                                            <a href="print_receipt.php?id=<?php echo $member['latest_payment_id']; ?>&from=members" class="btn btn-sm btn-outline-info me-1" target="_blank">
+                                                <i class="fas fa-eye"></i> View Receipt
+                                            </a>
+                                            <?php endif; ?>
+                                            <a href="?edit=<?php echo $member['id']; ?>" class="btn btn-sm btn-outline-primary me-1">
+                                                <i class="fas fa-edit"></i>
+                                            </a>
+                                            <a href="?delete=<?php echo $member['id']; ?>" class="btn btn-sm btn-outline-danger" onclick="return confirm('Are you sure?')">
+                                                <i class="fas fa-trash"></i>
+                                            </a>
+                                        </td>
+                                    </tr>
+                                    <?php endwhile; ?>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Footer -->
+    <footer class="bg-light text-center text-muted py-3 mt-5 border-top">
+        <div class="container">
+            <small>Developed by Tyron Del Valle</small>
+        </div>
+    </footer>
+
+    <!-- Add Member Modal -->
+    <div class="modal fade" id="addMemberModal" tabindex="-1">
+        <div class="modal-dialog modal-lg">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title">Add New Member</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <form method="POST">
+                    <div class="modal-body">
+                        <div class="row">
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label">Full Name <span class="text-danger">*</span></label>
+                                <input type="text" class="form-control" name="fullname" required>
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label">Email</label>
+                                <input type="email" class="form-control" name="email">
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label">Phone</label>
+                                <input type="text" class="form-control" name="phone">
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label">Plan <span class="text-danger">*</span></label>
+                                <select class="form-control" name="plan" id="plan" required>
+                                    <option value="Half Month">Half Month</option>
+                                    <option value="1 Month">1 Month</option>
+                                    <option value="2 Months">2 Months</option>
+                                    <option value="3 Months">3 Months</option>
+                                    <option value="4 Months">4 Months</option>
+                                    <option value="5 Months">5 Months</option>
+                                    <option value="6 Months">6 Months</option>
+                                    <option value="7 Months">7 Months</option>
+                                    <option value="8 Months">8 Months</option>
+                                    <option value="9 Months">9 Months</option>
+                                    <option value="10 Months">10 Months</option>
+                                    <option value="11 Months">11 Months</option>
+                                    <option value="1 Year">1 Year</option>
+                                    <option value="2 Years">2 Years</option>
+                                    <option value="3 Years">3 Years</option>
+                                    <option value="Manual">Manual</option>
+                                </select>
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label">Start Date <span class="text-danger">*</span></label>
+                                <input type="date" class="form-control" name="start_date" id="start_date" required>
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label">End Date <span class="text-danger">*</span></label>
+                                <input type="date" class="form-control" name="end_date" id="end_date" readonly required>
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label">Address</label>
+                                <textarea class="form-control" name="address" rows="2"></textarea>
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <div class="form-check">
+                                    <input class="form-check-input" type="checkbox" id="is_student" name="is_student">
+                                    <label class="form-check-label" for="is_student">
+                                        Is this member a student?
+                                    </label>
+                                </div>
+                            </div>
+                            <div class="col-md-6 mb-3 student-id-field" style="display: none;">
+                                <label class="form-label">Student ID</label>
+                                <input type="text" class="form-control" name="student_id" placeholder="Enter student ID for verification">
+                            </div>
+                        </div>
+
+                        <!-- QR Code Section -->
+                        <hr>
+                        <h6 class="mb-3">QR Code Generation <span class="text-danger">*</span></h6>
+                        <div class="row">
+                            <div class="col-md-12 mb-3">
+                                <input type="hidden" id="qr_token" name="qr_token" value="">
+                                <input type="hidden" id="generated_qr_path" name="generated_qr_path">
+                                <input type="hidden" id="qr_generated" name="qr_generated" value="0">
+                                <button type="button" id="generateQRBtn" class="btn btn-info">
+                                    <i class="fas fa-qrcode me-2"></i>Generate QR Code
+                                </button>
+                                <div id="qrPreview" class="mt-3" style="display: none;">
+                                    <div class="text-center">
+                                        <img id="qrImage" src="" alt="QR Code" class="img-fluid" style="max-width: 200px;">
+                                        <p class="mt-2 text-success">QR Code generated successfully!</p>
+                                        <p class="text-muted small" id="memberCodeDisplay"></p>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Payment Section -->
+                        <hr>
+                        <h6 class="mb-3">Payment Information</h6>
+                        <div class="row">
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label">Payment Method</label>
+                                <select class="form-control" name="payment_method" id="payment_method">
+                                    <option value="">No Payment</option>
+                                    <option value="Cash">Cash</option>
+                                    <option value="GCash">GCash</option>
+                                    <option value="Maya">Maya</option>
+                                    <option value="Bank Transfer">Bank Transfer</option>
+                                </select>
+                            </div>
+                            <div class="col-md-6 mb-3 payment-amount-field" style="display: none;">
+                                <label class="form-label">Amount (₱)</label>
+                                <input type="number" class="form-control" name="amount" id="payment_amount" min="0" step="0.01" placeholder="Enter amount">
+                            </div>
+                            <div class="col-md-6 mb-3 reference-field" style="display: none;">
+                                <label class="form-label">Reference Number</label>
+                                <input type="text" class="form-control" name="reference_no" id="reference_no" placeholder="Enter reference number">
+                            </div>
+                        </div>
+                    </div>
+                    <div class="modal-footer">
+                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                        <button type="submit" name="add_member" class="btn btn-primary">Add Member</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- Edit Member Modal -->
+    <div class="modal fade" id="editMemberModal" tabindex="-1">
+        <div class="modal-dialog modal-lg">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title">Edit Member</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <form method="POST" id="editForm">
+                    <input type="hidden" name="id" id="editId">
+                    <div class="modal-body">
+                        <div class="row">
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label">Member Code</label>
+                                <input type="text" class="form-control" name="member_code" id="editMemberCode" required>
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label">Full Name <span class="text-danger">*</span></label>
+                                <input type="text" class="form-control" name="fullname" id="editFullname" required>
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label">Email</label>
+                                <input type="email" class="form-control" name="email" id="editEmail">
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label">Phone</label>
+                                <input type="text" class="form-control" name="phone" id="editPhone">
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label">Plan <span class="text-danger">*</span></label>
+                                <select class="form-control" name="plan" id="editPlan" required>
+                                    <option value="Per Session">Per Session</option>
+                                    <option value="Half Month">Half Month</option>
+                                    <option value="1 Month">1 Month</option>
+                                    <option value="2 Months">2 Months</option>
+                                    <option value="3 Months">3 Months</option>
+                                    <option value="4 Months">4 Months</option>
+                                    <option value="5 Months">5 Months</option>
+                                    <option value="6 Months">6 Months</option>
+                                    <option value="7 Months">7 Months</option>
+                                    <option value="8 Months">8 Months</option>
+                                    <option value="9 Months">9 Months</option>
+                                    <option value="10 Months">10 Months</option>
+                                    <option value="11 Months">11 Months</option>
+                                    <option value="1 Year">1 Year</option>
+                                    <option value="2 Years">2 Years</option>
+                                    <option value="3 Years">3 Years</option>
+                                    <option value="Manual">Manual</option>
+                                </select>
+                            </div>
+                            <!-- Keep status value, but hide it from the edit form UI -->
+                            <input type="hidden" name="status" id="editStatus">
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label">Start Date <span class="text-danger">*</span></label>
+                                <input type="date" class="form-control" name="start_date" id="editStartDate" required>
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label">End Date <span class="text-danger">*</span></label>
+                                <input type="date" class="form-control" name="end_date" id="editEndDate" required>
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label">Address</label>
+                                <textarea class="form-control" name="address" id="editAddress" rows="2"></textarea>
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <div class="form-check">
+                                    <input class="form-check-input" type="checkbox" id="edit_is_student" name="is_student">
+                                    <label class="form-check-label" for="edit_is_student">
+                                        Is this member a student?
+                                    </label>
+                                </div>
+                            </div>
+                            <div class="col-md-6 mb-3 edit-student-id-field" style="display: none;">
+                                <label class="form-label">Student ID</label>
+                                <input type="text" class="form-control" name="student_id" id="edit_student_id" placeholder="Enter student ID for verification">
+                            </div>
+                        </div>
+                    </div>
+                    <div class="modal-footer">
+                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                        <button type="submit" name="update_member" class="btn btn-primary">Update Member</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- Quick Add Per Session Modal -->
+    <div class="modal fade" id="quickAddModal" tabindex="-1">
+        <div class="modal-dialog">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title">Quick Add Per Session Member</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <form method="POST">
+                    <div class="modal-body">
+                        <div class="mb-3">
+                            <label class="form-label">Full Name <span class="text-danger">*</span></label>
+                            <input type="text" class="form-control" name="fullname" required>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">Phone</label>
+                            <input type="text" class="form-control" name="phone">
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">Per Session Amount (₱) <span class="text-danger">*</span></label>
+                            <input type="number" class="form-control" id="quick_amount" name="amount" value="50" min="0" step="0.01" required>
+                        </div>
+                        <div class="mb-3">
+                            <div class="form-check">
+                                <input class="form-check-input" type="checkbox" id="quick_is_student" name="is_student">
+                                <label class="form-check-label" for="quick_is_student">
+                                    Is this member a student?
+                                </label>
+                            </div>
+                        </div>
+                        <div class="mb-3 quick-student-id-field" style="display: none;">
+                            <label class="form-label">Student ID <span class="text-danger">*</span></label>
+                            <input type="text" class="form-control" name="student_id" placeholder="Enter student ID for verification">
+                        </div>
+                        <div class="mb-3">
+                            <div class="alert alert-info">
+                                <strong>Total Amount: ₱<span id="total_amount">50.00</span></strong>
+                                <small class="d-block mt-1">This will create a per session member with today's date as start/end date and automatically add a payment record.</small>
+                                <small class="d-block mt-1"><strong>Expiry:</strong> Until Today</small>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="modal-footer">
+                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                        <button type="submit" name="quick_add_member" class="btn btn-success">Add Member & Payment</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- QR Code Modal -->
+    <div class="modal fade" id="qrModal" tabindex="-1">
+        <div class="modal-dialog modal-dialog-centered">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title">QR Code - <span id="qrMemberName"></span></h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body text-center">
+                    <div id="qrCodeContainer" class="mb-3">
+                        <!-- QR Code will be generated here -->
+                    </div>
+                    <button type="button" class="btn btn-primary" onclick="printQR()">
+                        <i class="fas fa-print me-2"></i>Print QR
+                    </button>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        function editMember(id) {
+            // Populate edit modal with member data
+            <?php if ($edit_member): ?>
+            document.getElementById('editId').value = '<?php echo $edit_member['id']; ?>';
+            document.getElementById('editMemberCode').value = '<?php echo htmlspecialchars($edit_member['member_code']); ?>';
+            document.getElementById('editFullname').value = '<?php echo htmlspecialchars($edit_member['fullname']); ?>';
+            document.getElementById('editEmail').value = '<?php echo htmlspecialchars($edit_member['email']); ?>';
+            document.getElementById('editPhone').value = '<?php echo htmlspecialchars($edit_member['phone']); ?>';
+            document.getElementById('editPlan').value = '<?php echo htmlspecialchars($edit_member['plan']); ?>';
+            document.getElementById('editStatus').value = '<?php echo htmlspecialchars($edit_member['status']); ?>';
+            document.getElementById('editStartDate').value = '<?php echo htmlspecialchars($edit_member['start_date']); ?>';
+            document.getElementById('editEndDate').value = '<?php echo htmlspecialchars($edit_member['end_date']); ?>';
+            document.getElementById('editAddress').value = '<?php echo htmlspecialchars($edit_member['address']); ?>';
+            document.getElementById('edit_is_student').checked = <?php echo $edit_member['is_student'] ? 'true' : 'false'; ?>;
+            document.getElementById('edit_student_id').value = '<?php echo htmlspecialchars($edit_member['student_id'] ?? ''); ?>';
+            // Show/hide student ID field based on checkbox
+            const editStudentIdField = document.querySelector('.edit-student-id-field');
+            if (<?php echo $edit_member['is_student'] ? 'true' : 'false'; ?>) {
+                editStudentIdField.style.display = 'block';
+            } else {
+                editStudentIdField.style.display = 'none';
+            }
+            var editModal = new bootstrap.Modal(document.getElementById('editMemberModal'));
+            editModal.show();
+            <?php endif; ?>
+        }
+
+        // Trigger edit modal if edit parameter is present
+        <?php if (isset($_GET['edit'])): ?>
+        window.onload = function() {
+            editMember(<?php echo $_GET['edit']; ?>);
+        };
+        <?php endif; ?>
+
+        // Handle student checkbox in members.php
+        const studentCheckbox = document.getElementById('is_student');
+        if (studentCheckbox) {
+            studentCheckbox.addEventListener('change', function() {
+                const studentIdField = document.querySelector('.student-id-field');
+                if (this.checked) {
+                    studentIdField.style.display = 'block';
+                } else {
+                    studentIdField.style.display = 'none';
+                }
+            });
+        }
+
+        // Handle edit student checkbox in members.php
+        const editStudentCheckbox = document.getElementById('edit_is_student');
+        if (editStudentCheckbox) {
+            editStudentCheckbox.addEventListener('change', function() {
+                const editStudentIdField = document.querySelector('.edit-student-id-field');
+                const editStudentIdInput = editStudentIdField.querySelector('input[name="student_id"]');
+                if (this.checked) {
+                    editStudentIdField.style.display = 'block';
+                    editStudentIdInput.setAttribute('required', 'required');
+                } else {
+                    editStudentIdField.style.display = 'none';
+                    editStudentIdInput.removeAttribute('required');
+                }
+            });
+        }
+
+        // Handle quick add student checkbox
+        const quickStudentCheckbox = document.getElementById('quick_is_student');
+        if (quickStudentCheckbox) {
+            quickStudentCheckbox.addEventListener('change', function() {
+                const quickStudentIdField = document.querySelector('.quick-student-id-field');
+                if (this.checked) {
+                    quickStudentIdField.style.display = 'block';
+                } else {
+                    quickStudentIdField.style.display = 'none';
+                }
+            });
+        }
+
+        // Apply filters function
+        function applyFilters() {
+            const searchValue = document.getElementById('searchInput').value;
+            const planFilterValue = document.getElementById('planFilterSelect').value;
+            const paymentFilterValue = document.getElementById('paymentFilterSelect').value;
+            const params = new URLSearchParams();
+            if (searchValue) params.set('search', searchValue);
+            params.set('plan_filter', planFilterValue);
+            params.set('payment_filter', paymentFilterValue);
+            window.location.href = 'members.php?' + params.toString();
+        }
+
+        // Clear filters function
+        function clearFilters() {
+            document.getElementById('searchInput').value = '';
+            document.getElementById('planFilterSelect').value = 'all';
+            document.getElementById('paymentFilterSelect').value = 'all';
+            window.location.href = 'members.php';
+        }
+
+        // Function to calculate and update total amount
+        function updateTotalAmount() {
+            const amountInput = document.getElementById('quick_amount');
+            const studentCheckbox = document.getElementById('quick_is_student');
+            const totalAmountSpan = document.getElementById('total_amount');
+
+            const amount = parseFloat(amountInput.value) || 0;
+            const isStudent = studentCheckbox.checked;
+            const discount = isStudent ? amount * 0.20 : 0;
+            const total = amount - discount;
+
+            totalAmountSpan.textContent = total.toFixed(2);
+        }
+
+        // Function to calculate end date based on plan and start date
+        function calculateEndDate(plan, startDate) {
+            if (!startDate) return '';
+            const start = new Date(startDate);
+            let end = new Date(start);
+
+            switch (plan) {
+                case 'Half Month':
+                    end.setDate(end.getDate() + 15);
+                    break;
+                case '1 Month':
+                    end.setMonth(end.getMonth() + 1);
+                    break;
+                case '2 Months':
+                    end.setMonth(end.getMonth() + 2);
+                    break;
+                case '3 Months':
+                    end.setMonth(end.getMonth() + 3);
+                    break;
+                case '4 Months':
+                    end.setMonth(end.getMonth() + 4);
+                    break;
+                case '5 Months':
+                    end.setMonth(end.getMonth() + 5);
+                    break;
+                case '6 Months':
+                    end.setMonth(end.getMonth() + 6);
+                    break;
+                case '7 Months':
+                    end.setMonth(end.getMonth() + 7);
+                    break;
+                case '8 Months':
+                    end.setMonth(end.getMonth() + 8);
+                    break;
+                case '9 Months':
+                    end.setMonth(end.getMonth() + 9);
+                    break;
+                case '10 Months':
+                    end.setMonth(end.getMonth() + 10);
+                    break;
+                case '11 Months':
+                    end.setMonth(end.getMonth() + 11);
+                    break;
+                case '1 Year':
+                    end.setFullYear(end.getFullYear() + 1);
+                    break;
+                case '2 Years':
+                    end.setFullYear(end.getFullYear() + 2);
+                    break;
+                case '3 Years':
+                    end.setFullYear(end.getFullYear() + 3);
+                    break;
+                case 'Per Session':
+                    // End date same as start date
+                    break;
+                case 'Manual':
+                    // Leave as is
+                    break;
+                default:
+                    break;
+            }
+
+            return end.toISOString().split('T')[0];
+        }
+
+        // Function to update end date in add member modal
+        function updateEndDate() {
+            const planSelect = document.getElementById('plan');
+            const startDateInput = document.getElementById('start_date');
+            const endDateInput = document.getElementById('end_date');
+
+            if (planSelect && startDateInput && endDateInput) {
+                const plan = planSelect.value;
+                const startDate = startDateInput.value;
+                const calculatedEndDate = calculateEndDate(plan, startDate);
+                if (calculatedEndDate && plan !== 'Manual') {
+                    endDateInput.value = calculatedEndDate;
+                }
+            }
+        }
+
+        // Function to update end date in edit member modal
+        function updateEditEndDate() {
+            const planSelect = document.getElementById('editPlan');
+            const startDateInput = document.getElementById('editStartDate');
+            const endDateInput = document.getElementById('editEndDate');
+
+            if (planSelect && startDateInput && endDateInput) {
+                const plan = planSelect.value;
+                const startDate = startDateInput.value;
+                const calculatedEndDate = calculateEndDate(plan, startDate);
+                if (calculatedEndDate && plan !== 'Manual') {
+                    endDateInput.value = calculatedEndDate;
+                }
+            }
+        }
+
+        // Add event listeners for amount input and student checkbox
+        document.addEventListener('DOMContentLoaded', function() {
+            const amountInput = document.getElementById('quick_amount');
+            const studentCheckbox = document.getElementById('quick_is_student');
+
+            if (amountInput) {
+                amountInput.addEventListener('input', updateTotalAmount);
+            }
+            if (studentCheckbox) {
+                studentCheckbox.addEventListener('change', updateTotalAmount);
+            }
+
+            // Initial calculation
+            updateTotalAmount();
+
+            // Add event listeners for plan and start date changes in add member modal
+            const planSelect = document.getElementById('plan');
+            const startDateInput = document.getElementById('start_date');
+            if (planSelect) {
+                planSelect.addEventListener('change', updateEndDate);
+            }
+            if (startDateInput) {
+                startDateInput.addEventListener('change', updateEndDate);
+            }
+
+            // Add event listeners for plan and start date changes in edit member modal
+            const editPlanSelect = document.getElementById('editPlan');
+            const editStartDateInput = document.getElementById('editStartDate');
+            if (editPlanSelect) {
+                editPlanSelect.addEventListener('change', updateEditEndDate);
+            }
+            if (editStartDateInput) {
+                editStartDateInput.addEventListener('change', updateEditEndDate);
+            }
+
+            // Handle payment method selection
+            const paymentMethodSelect = document.getElementById('payment_method');
+            if (paymentMethodSelect) {
+                paymentMethodSelect.addEventListener('change', function() {
+                    const paymentAmountField = document.querySelector('.payment-amount-field');
+                    const referenceField = document.querySelector('.reference-field');
+                    if (this.value === '') {
+                        paymentAmountField.style.display = 'none';
+                        referenceField.style.display = 'none';
+                    } else {
+                        paymentAmountField.style.display = 'block';
+                        if (this.value === 'GCash' || this.value === 'Maya' || this.value === 'Bank Transfer') {
+                            referenceField.style.display = 'block';
+                        } else {
+                            referenceField.style.display = 'none';
+                        }
+                    }
+                });
+            }
+
+            // Function to validate required fields
+            function validateRequiredFields() {
+                const fullname = document.querySelector('input[name="fullname"]').value.trim();
+                const plan = document.querySelector('select[name="plan"]').value;
+                const startDate = document.querySelector('input[name="start_date"]').value;
+                const endDate = document.querySelector('input[name="end_date"]').value;
+
+                return fullname !== '' && plan !== '' && startDate !== '' && endDate !== '';
+            }
+
+            // Function to show validation notification
+            function showValidationNotification() {
+                // Remove existing notification if any
+                const existingNotification = document.querySelector('.validation-notification');
+                if (existingNotification) {
+                    existingNotification.remove();
+                }
+
+                // Create notification element
+                const notification = document.createElement('div');
+                notification.className = 'alert alert-warning alert-dismissible fade show validation-notification mt-3';
+                notification.innerHTML = `
+                    <i class="fas fa-exclamation-triangle me-2"></i>
+                    <strong>Please complete all required fields first:</strong>
+                    <ul class="mb-0 mt-2">
+                        <li>Full Name</li>
+                        <li>Plan</li>
+                        <li>Start Date</li>
+                        <li>End Date</li>
+                    </ul>
+                    <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+                `;
+
+                // Insert notification before QR Code section
+                const qrSections = document.querySelectorAll('h6');
+                let qrSection = null;
+                for (let h6 of qrSections) {
+                    if (h6.textContent.includes('QR Code Generation')) {
+                        qrSection = h6;
+                        break;
+                    }
+                }
+
+                if (qrSection) {
+                    qrSection.parentNode.insertBefore(notification, qrSection);
+                } else {
+                    // Fallback: insert before the QR code section
+                    const hrElements = document.querySelectorAll('hr');
+                    if (hrElements.length >= 1) {
+                        hrElements[0].parentNode.insertBefore(notification, hrElements[0]);
+                    }
+                }
+
+                // Auto-dismiss after 5 seconds
+                setTimeout(() => {
+                    if (notification.parentNode) {
+                        notification.remove();
+                    }
+                }, 5000);
+            }
+
+            // Handle QR code generation
+            const generateQRBtn = document.getElementById('generateQRBtn');
+            const qrPreview = document.getElementById('qrPreview');
+            const qrImage = document.getElementById('qrImage');
+            const addMemberBtn = document.querySelector('button[name="add_member"]');
+
+            if (generateQRBtn && qrPreview && qrImage && addMemberBtn) {
+                // Initially disable the Add Member button
+                addMemberBtn.disabled = true;
+
+                generateQRBtn.addEventListener('click', function() {
+                    // Validate required fields
+                    if (!validateRequiredFields()) {
+                        showValidationNotification();
+                        return;
+                    }
+
+                    // Show loading state
+                    generateQRBtn.innerHTML = '<i class="fas fa-spinner fa-spin me-2"></i>Generating...';
+                    generateQRBtn.disabled = true;
+
+                    // Generate QR code using AJAX
+                   fetch('../generate_member_qr.php')
+
+                        .then(response => response.json())
+                        .then(data => {
+                            // Set hidden fields with generated data
+                            document.getElementById('qr_token').value = data.qr_token;
+                            document.getElementById('generated_qr_path').value = data.path;
+                            document.getElementById('qr_generated').value = '1';
+
+                            // Set the QR code image source
+                            qrImage.src = "../" + data.path;
+                            qrImage.style.display = 'block';
+
+                         
+
+                            // Show preview
+                            qrPreview.style.display = 'block';
+
+                            // Enable the Add Member button
+                            addMemberBtn.disabled = false;
+
+                            // Change button text to indicate it's generated
+                            generateQRBtn.innerHTML = '<i class="fas fa-check me-2"></i>QR Code Generated';
+                            generateQRBtn.classList.remove('btn-info');
+                            generateQRBtn.classList.add('btn-success');
+                        })
+                        .catch(error => {
+                            console.error('Error generating QR code:', error);
+                            generateQRBtn.innerHTML = '<i class="fas fa-times me-2"></i>Error - Try Again';
+                            generateQRBtn.classList.remove('btn-info');
+                            generateQRBtn.classList.add('btn-danger');
+                            generateQRBtn.disabled = false;
+                        });
+                });
+            }
+
+            // Function to print QR code
+            window.printQRCode = function(imagePath, memberCode, memberName) {
+                const printWindow = window.open('', '_blank', 'width=800,height=600');
+                printWindow.document.title = `QR Code - ${memberName}`;
+                printWindow.document.write(`
+                    <html>
+                    <head>
+                        <title>QR Code - ${memberName}</title>
+                        <style>
+                            @page {
+                                size: A4;
+                                margin: 0.5in;
+                            }
+                            body {
+                                font-family: Arial, sans-serif;
+                                margin: 0;
+                                padding: 20px;
+                                text-align: center;
+                                height: 100vh;
+                                display: flex;
+                                flex-direction: column;
+                                justify-content: center;
+                                align-items: center;
+                            }
+                            .header {
+                                margin-bottom: 30px;
+                            }
+                            .logo {
+                                width: 100px;
+                                height: auto;
+                                margin-bottom: 10px;
+                            }
+                            .gym-name {
+                                font-size: 24px;
+                                font-weight: bold;
+                                margin-bottom: 5px;
+                            }
+                            .qr-container {
+                                border: 2px solid #000;
+                                padding: 20px;
+                                display: inline-block;
+                                background: white;
+                                margin: 20px 0;
+                            }
+                            .qr-code {
+                                width: 300px;
+                                height: 300px;
+                                max-width: 100%;
+                            }
+                            .member-info {
+                                font-size: 16px;
+                                margin: 15px 0;
+                            }
+                            .instructions {
+                                font-size: 14px;
+                                color: #666;
+                                margin-top: 20px;
+                            }
+                        </style>
+                    </head>
+                    <body>
+                        <div class="header">
+                            <img src="../gym logo.jpg" alt="Gym Logo" class="logo">
+                            <div class="gym-name">Gym Olympic Fitness</div>
+                            <div>Membership QR Code</div>
+                        </div>
+
+                        <div class="qr-container">
+                            <img src="${imagePath}" alt="QR Code" class="qr-code">
+                        </div>
+
+                        <div class="member-info">
+                            <strong>Member Name:</strong> ${memberName}<br>
+                            <strong>Member Code:</strong> ${memberCode}
+                        </div>
+
+                        <div class="instructions">
+                            Scan this QR code for attendance check-in at the gym entrance
+                        </div>
+                    </body>
+                    </html>
+                `);
+                printWindow.document.close();
+                printWindow.print();
+            };
+
+            // QR Code viewing and printing functions
+            window.viewQR = function(fullname, qrCodePath) {
+                document.getElementById('qrMemberName').textContent = fullname;
+                const qrContainer = document.getElementById('qrCodeContainer');
+                // Display the stored QR code image from the database path
+                qrContainer.innerHTML = `<img src="../${qrCodePath}" class="img-fluid" style="max-width: 200px;">`;
+                const modal = new bootstrap.Modal(document.getElementById('qrModal'));
+                modal.show();
+            };
+
+            window.printQR = function() {
+                const qrContainer = document.getElementById('qrCodeContainer');
+                const printWindow = window.open('', '_blank');
+                printWindow.document.write('<html><head><title>QR Code</title></head><body style="text-align: center;">');
+                printWindow.document.write('<h2>' + document.getElementById('qrMemberName').textContent + '</h2>');
+                printWindow.document.write('<img src="' + qrContainer.querySelector('img').src + '" style="max-width: 300px;">');
+                printWindow.document.write('</body></html>');
+                printWindow.document.close();
+                printWindow.print();
+            };
+        });
+    </script>
+    <script>
+        // Sidebar toggle functionality
+        document.addEventListener('DOMContentLoaded', function() {
+            const sidebarToggle = document.getElementById('sidebarToggle');
+            const sidebar = document.getElementById('sidebar');
+            const mainContent = document.querySelector('.flex-grow-1');
+
+            sidebarToggle.addEventListener('click', function() {
+                sidebar.classList.toggle('sidebar-collapsed');
+                mainContent.classList.toggle('main-expanded');
+
+                // Update toggle icon
+                const icon = sidebarToggle.querySelector('i');
+                if (sidebar.classList.contains('sidebar-collapsed')) {
+                    icon.className = 'fas fa-times'; // Close icon when collapsed
+                } else {
+                    icon.className = 'fas fa-bars'; // Bars icon when expanded
+                }
+            });
+        });
+    </script>
+</body>
+</html>
